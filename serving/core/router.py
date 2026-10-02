@@ -1,8 +1,65 @@
 import bisect
 import json
 import random
+import ast
+import math
+import os
 from .logger import get_logger
+from .request import Request
 
+_SR_EPS = 1e-12
+
+
+def _sr_add(a, b):
+    return a + b
+
+
+def _sr_sub(a, b):
+    return a - b
+
+
+def _sr_mul(a, b):
+    return a * b
+
+
+def _sr_pdiv(a, b):
+    """Protected division."""
+    return a / b if abs(b) > _SR_EPS else 1.0
+
+
+def _sr_sqrtabs(x):
+    """Protected sqrt."""
+    return math.sqrt(abs(x))
+
+
+def _sr_logabs(x):
+    """Protected log."""
+    return math.log1p(abs(x))
+
+
+def _sr_square(x):
+    return x * x
+
+
+def _sr_absval(x):
+    return abs(x)
+
+
+_SR_FUNCS = {
+    "add": _sr_add,
+    "sub": _sr_sub,
+    "mul": _sr_mul,
+    "pdiv": _sr_pdiv,
+    "sqrtabs": _sr_sqrtabs,
+    "logabs": _sr_logabs,
+    "square": _sr_square,
+    "absval": _sr_absval,
+
+    # Convenience aliases for hand-written equations:
+    "sqrt": _sr_sqrtabs,
+    "log": _sr_logabs,
+    "abs": _sr_absval,
+}
 
 class Router:
     def __init__(
@@ -42,12 +99,48 @@ class Router:
             self._select_instance = self._rand_select
         elif self.routing_policy == "LOAD":
             self._select_instance = self._least_load_select
+        elif self.routing_policy == "LMETRIC":
+            self._select_instance = self._lmetric
         elif self.routing_policy == "CUSTOM":
             self._select_instance = self._custom_select
         else:
             raise ValueError(f"Unknown routing_policy '{routing_policy}'. "
                              "Supported: RR, RAND, LOAD, CUSTOM")
         self.logger = get_logger(self.__class__)
+
+        self._custom_expr_text = None
+        self._custom_expr_code = None
+
+        if self.routing_policy == "CUSTOM":
+            self._init_custom_expression()
+
+        # ------------------------------------------------------------------
+        # Prefix popularity x_p
+        # ------------------------------------------------------------------
+
+        # EWMA update strength.
+        # Roughly: effective history ~ 1 / alpha arrivals.
+        self._xp_alpha = float(os.environ.get("XP_ALPHA", "0.05"))
+
+        if not (0.0 < self._xp_alpha <= 1.0):
+            raise ValueError("XP_ALPHA must be in (0, 1]")
+
+        # Fallback prefix-class definition when the workload has no explicit
+        # prefix_id. This is number of leading token IDs used as the class key.
+        self._xp_prefix_tokens = int(
+            os.environ.get("XP_PREFIX_TOKENS", "256")
+        )
+
+        if self._xp_prefix_tokens <= 0:
+            raise ValueError("XP_PREFIX_TOKENS must be > 0")
+
+        # EWMA mass associated with each prefix class.
+        self._xp_mass = {}
+
+        # Sum of all EWMA masses. Used so XP stays normalized to [0, 1].
+        self._xp_total_mass = 0.0
+
+        self._xp_num_observations = 0
 
     # -----------------------------------------------------------------------
     # Instance selection policies
@@ -62,16 +155,16 @@ class Router:
         else:
             self.prefill_rr_counter = value
 
-    def _rr_select(self, schedulers, role):
+    def _rr_select(self, schedulers, role, req_data=None):
         num_instances = len(schedulers)
         idx = self._get_counter(role) % num_instances
         self._set_counter(role, idx + 1)
         return idx
 
-    def _rand_select(self, schedulers, role):
+    def _rand_select(self, schedulers, role, req_data=None):
         return self._rnd.randrange(len(schedulers))
 
-    def _least_load_select(self, schedulers, role):
+    def _least_load_select(self, schedulers, role, req_data=None):
         """vLLM-style least-loaded routing, normalized by instance capacity."""
         best_idx = 0
         best_score = float('inf')
@@ -93,9 +186,398 @@ class Router:
         self._set_counter(role, (best_idx + 1) % num_instances)
         return best_idx
 
-    def _custom_select(self, schedulers, role):
-        raise NotImplementedError("Implement custom routing policy.")
+    def _custom_select(self, schedulers, role, req_data=None):
+        """
+        Symbolic routing.
 
+        For every candidate instance i:
+
+            P_i, BS_i = live simulator state
+            score_i = f(P_i, BS_i)
+
+        Route to:
+
+            argmin_i score_i
+        """
+
+        if role == "decode" or req_data is None:
+            return self._least_load_select(
+                schedulers,
+                role,
+                req_data,
+            )
+
+        num_instances = len(schedulers)
+
+        if num_instances == 0:
+            raise RuntimeError(
+                "CUSTOM called with no candidate instances"
+            )
+
+        best_idx = None
+        best_score = float("inf")
+
+        # Deterministic fair tie-breaking.
+        start = self._get_counter(role) % num_instances
+
+        for offset in range(num_instances):
+            idx = (start + offset) % num_instances
+            sched = schedulers[idx]
+
+            feat = self._routing_features(
+                sched,
+                req_data,
+            )
+
+            score = self._eval_custom_expression(
+                feat["P"],
+                feat["BS"],
+                feat["XP"],
+            )
+
+            self.logger.debug(
+                "CUSTOM expr=%s req=%d inst=%d "
+                "P=%d BS=%d hit=%d "
+                "queued_P=%d incoming_P=%d score=%g",
+                self._custom_expr_text,
+                req_data["index"],
+                sched.instance_id,
+                feat["P"],
+                feat["BS"],
+                feat["XP"],
+                feat["prefix_hit"],
+                feat["queued_p"],
+                feat["incoming_p"],
+                score,
+            )
+
+            if score < best_score:
+                best_score = score
+                best_idx = idx
+
+        # A pathological expression might produce inf everywhere.
+        if best_idx is None:
+            self.logger.warning(
+                "CUSTOM expression produced no valid score; "
+                "falling back to LOAD"
+            )
+
+            return self._least_load_select(
+                schedulers,
+                role,
+                req_data,
+            )
+
+        self._set_counter(
+            role,
+            (best_idx + 1) % num_instances,
+        )
+
+        return best_idx
+
+    def _lmetric(self, schedulers, role, req_data=None):
+        """LMETRIC: minimize P * BS."""
+
+        if role == "decode" or req_data is None:
+            return self._least_load_select(
+                schedulers,
+                role,
+                req_data,
+            )
+
+        num_instances = len(schedulers)
+
+        if num_instances == 0:
+            raise RuntimeError(
+                "LMETRIC called with no candidate instances"
+            )
+
+        best_idx = None
+        best_score = float("inf")
+
+        start = self._get_counter(role) % num_instances
+
+        for offset in range(num_instances):
+            idx = (start + offset) % num_instances
+            sched = schedulers[idx]
+
+            feat = self._routing_features(
+                sched,
+                req_data,
+            )
+
+            score = feat["P"] * feat["BS"]
+
+            self.logger.debug(
+                "LMETRIC req=%d inst=%d "
+                "P=%d BS=%d hit=%d score=%d",
+                req_data["index"],
+                sched.instance_id,
+                feat["P"],
+                feat["BS"],
+                feat["prefix_hit"],
+                score,
+            )
+
+            if score < best_score:
+                best_score = score
+                best_idx = idx
+
+        self._set_counter(
+            role,
+            (best_idx + 1) % num_instances,
+        )
+
+        return best_idx
+
+    def _xp_prefix_key(self, req_data):
+        """
+        Return the prefix class p for this request.
+
+        Preferred:
+            explicit prefix_id supplied by the workload.
+
+        Fallback:
+            first XP_PREFIX_TOKENS input token IDs.
+        """
+
+        # Best option for controlled hotspot experiments.
+        explicit = req_data.get("prefix_id")
+
+        if explicit is not None:
+            return ("prefix_id", str(explicit))
+
+        # Existing LLMServingSim traces.
+        token_ids = req_data.get("input_hash_ids", [])
+
+        if not token_ids:
+            return None
+
+        n = min(
+            len(token_ids),
+            self._xp_prefix_tokens,
+        )
+
+        # Tuple is hashable and collision-free with respect to these token IDs.
+        return ("tokens", tuple(token_ids[:n]))
+
+
+    def _observe_prefix_popularity(self, req_data):
+        """
+        Observe one newly arrived request and return x_p:
+
+            x_p = recent fraction of traffic belonging to prefix p
+
+        using an exponentially weighted moving average over arrivals.
+
+        Returns a normalized value in [0, 1].
+        """
+
+        key = self._xp_prefix_key(req_data)
+
+        if key is None:
+            return 0.0
+
+        alpha = self._xp_alpha
+        decay = 1.0 - alpha
+
+        # Decay old observations.
+        dead_keys = []
+
+        for old_key, mass in self._xp_mass.items():
+            new_mass = mass * decay
+
+            if new_mass < 1e-12:
+                dead_keys.append(old_key)
+            else:
+                self._xp_mass[old_key] = new_mass
+
+        for old_key in dead_keys:
+            del self._xp_mass[old_key]
+
+        self._xp_total_mass *= decay
+
+        # Current observation: I_p(t) = 1.
+        self._xp_mass[key] = (
+            self._xp_mass.get(key, 0.0)
+            + alpha
+        )
+
+        self._xp_total_mass += alpha
+        self._xp_num_observations += 1
+
+        if self._xp_total_mass <= 0.0:
+            return 0.0
+
+        xp = self._xp_mass[key] / self._xp_total_mass
+
+        # Numerical safety.
+        return min(1.0, max(0.0, xp))
+
+
+    def _routing_features(self, sched, req_data):
+        """Return the P and BS primitives for one candidate instance."""
+
+        input_toks = int(req_data["input_toks"])
+        input_hash_ids = req_data.get("input_hash_ids", [])
+
+        prefix_hit = self._lmetric_prefix_hit(
+            sched,
+            input_toks,
+            input_hash_ids,
+        )
+
+        incoming_p = max(
+            0,
+            input_toks - prefix_hit,
+        )
+
+        queued_p = self._lmetric_queued_prefill_tokens(sched)
+
+        # Same P definition as your LMETRIC implementation.
+        p_tokens = queued_p + incoming_p
+
+        # Prospective BS if this request were routed here.
+        batch_size = (
+            len(sched.waiting)
+            + len(sched.running)
+            + 1
+        )
+
+        return {
+            "P": p_tokens,
+            "BS": batch_size,
+            "XP": float(req_data.get("XP", 0.0)),
+            "prefix_hit": prefix_hit,
+            "incoming_p": incoming_p,
+            "queued_p": queued_p,
+        }
+
+    def _init_custom_expression(self):
+        """
+        Compile ROUTING_EXPR once at startup.
+
+        Examples:
+            ROUTING_EXPR='mul(P, BS)'
+            ROUTING_EXPR='mul(P, sqrtabs(BS))'
+            ROUTING_EXPR='P * sqrt(BS)'
+        """
+
+        expr = os.environ.get(
+            "ROUTING_EXPR",
+            "mul(P, BS)",
+        )
+
+        try:
+            tree = ast.parse(expr, mode="eval")
+        except SyntaxError as exc:
+            raise ValueError(
+                f"Invalid ROUTING_EXPR {expr!r}: {exc}"
+            ) from exc
+
+        allowed_names = {
+            "P",
+            "BS",
+            "XP",
+        } | set(_SR_FUNCS)
+
+        allowed_nodes = (
+            ast.Expression,
+            ast.BinOp,
+            ast.UnaryOp,
+            ast.Call,
+            ast.Name,
+            ast.Load,
+            ast.Constant,
+
+            ast.Add,
+            ast.Sub,
+            ast.Mult,
+            ast.Div,
+
+            ast.UAdd,
+            ast.USub,
+        )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed_nodes):
+                raise ValueError(
+                    "ROUTING_EXPR uses unsupported syntax "
+                    f"{type(node).__name__}: {expr}"
+                )
+
+            if isinstance(node, ast.Name):
+                if node.id not in allowed_names:
+                    raise ValueError(
+                        f"Unknown symbol {node.id!r}. "
+                        "Allowed variables: P, BS, XP. "
+                        f"Functions: {sorted(_SR_FUNCS)}"
+                    )
+
+            if isinstance(node, ast.Call):
+                if not isinstance(node.func, ast.Name):
+                    raise ValueError(
+                        "Only direct function calls are allowed"
+                    )
+
+                if node.func.id not in _SR_FUNCS:
+                    raise ValueError(
+                        f"Unsupported function: {node.func.id}"
+                    )
+
+                if node.keywords:
+                    raise ValueError(
+                        "Keyword arguments are not allowed"
+                    )
+
+            if isinstance(node, ast.Constant):
+                if type(node.value) not in (int, float):
+                    raise ValueError(
+                        "Only numeric constants are allowed"
+                    )
+
+        self._custom_expr_text = expr
+
+        self._custom_expr_code = compile(
+            tree,
+            "<ROUTING_EXPR>",
+            "eval",
+        )
+
+        self.logger.info(
+            "CUSTOM routing expression: %s",
+            expr,
+        )
+
+    def _eval_custom_expression(self, P, BS, XP):
+        scope = {
+            **_SR_FUNCS,
+            "P": float(P),
+            "BS": float(BS),
+            "XP": float(XP),
+        }
+
+        try:
+            score = eval(
+                self._custom_expr_code,
+                {"__builtins__": {}},
+                scope,
+            )
+
+            score = float(score)
+
+        except (
+            ArithmeticError,
+            OverflowError,
+            ValueError,
+            TypeError,
+        ):
+            return float("inf")
+
+        if not math.isfinite(score):
+            return float("inf")
+
+        return score
     # -----------------------------------------------------------------------
     # Request loading and real-time routing
     # -----------------------------------------------------------------------
@@ -198,7 +680,8 @@ class Router:
             if req_data['arrival_time_ns'] > current_time_ns:
                 break
 
-            instance_id = self._select_instance(self.prefill_schedulers, "prefill")
+            req_data["XP"] = self._observe_prefix_popularity(req_data)
+            instance_id = self._select_instance(self.prefill_schedulers, "prefill", req_data)
             sched = self.prefill_schedulers[instance_id]
 
             if sched.enable_prefix_caching:
@@ -303,6 +786,70 @@ class Router:
         if self._pending_idx < len(self._pending_requests):
             return self._pending_requests[self._pending_idx]['arrival_time_ns']
         return None
+
+    def _lmetric_prefix_hit(self, sched, input_toks, input_hash_ids):
+        """Return prefix-hit tokens if this prompt were routed to sched.
+
+        This is a read-only probe of the candidate instance's current prefix
+        cache. No KV blocks are allocated.
+        """
+        input_toks = int(input_toks)
+
+        if input_toks <= 0:
+            return 0
+
+        if not sched.enable_prefix_caching:
+            return 0
+
+        if not input_hash_ids:
+            return 0
+
+        probe = Request(
+            -1,                     # synthetic request id
+            sched.model,
+            input_toks,
+            input_toks + 1,         # output length irrelevant for prefix lookup
+            0,                      # synthetic arrival
+            sched.instance_id,
+            list(input_hash_ids),
+            [],                     # only prompt tokens matter here
+        )
+
+        _, npu_hit, lower_hit = sched.kv.get_computed_blocks(probe)
+
+        return npu_hit + lower_hit
+
+    def _lmetric_queued_prefill_tokens(self, sched):
+        """Estimate outstanding queued prefill/recompute work."""
+
+        total = 0
+
+        for req in sched.waiting:
+            # For a normal newly-arrived request, P concerns its prompt.
+            # For a preempted request, num_tokens_reached can include
+            # history that must be recovered/recomputed.
+            target = (
+                req.original_input
+                if req.is_init
+                else req.num_tokens_reached
+            )
+
+            # For ordinary initial requests, estimate the current reusable
+            # prompt prefix.
+            if req.is_init:
+                hit = self._lmetric_prefix_hit(
+                    sched,
+                    req.original_input,
+                    req.input_hash_ids,
+                )
+                available = max(req.num_computed_tokens, hit)
+            else:
+                # Conservative treatment of resumed work.
+                available = req.num_computed_tokens
+
+            total += max(0, target - available)
+
+        return total
 
     # -----------------------------------------------------------------------
     # Legacy: upfront routing (kept for backward compat)

@@ -1,0 +1,118 @@
+root@f25f125dc5d6:/app/LLMServingSim# python scripts/search_router_gp.py --num-reqs=50
+
+[EVAL] mul(P, BS)
+       TTFT=69.661 ms, P99-TTFT=195.995 ms, TPOT=8.527 ms, prefix=89.28%
+
+LMETRIC-via-CUSTOM baseline: mean TTFT=69.661 ms, mean TPOT=8.527 ms
+
+[EVAL] P
+       TTFT=96.054 ms, P99-TTFT=259.887 ms, TPOT=29.932 ms, prefix=89.38%
+
+[EVAL] BS
+       TTFT=115.056 ms, P99-TTFT=543.804 ms, TPOT=8.256 ms, prefix=69.81%
+
+[EVAL] mul(P, sqrtabs(BS))
+       TTFT=69.704 ms, P99-TTFT=194.474 ms, TPOT=8.815 ms, prefix=89.37%
+
+[EVAL] mul(sqrtabs(P), BS)
+       TTFT=71.361 ms, P99-TTFT=224.974 ms, TPOT=8.529 ms, prefix=88.87%
+
+[EVAL] add(P, BS)
+       TTFT=89.391 ms, P99-TTFT=233.275 ms, TPOT=25.841 ms, prefix=89.38%
+
+[EVAL] pdiv(P, BS)
+       TTFT=128.618 ms, P99-TTFT=294.388 ms, TPOT=51.671 ms, prefix=89.38%
+
+[EVAL] mul(P, square(BS))
+       TTFT=71.361 ms, P99-TTFT=224.974 ms, TPOT=8.529 ms, prefix=88.87%
+
+=== Generation 0 ===
+best expr: mul(P, BS)
+fitness:   1.000000
+TTFT:      69.661 ms
+P99 TTFT:  195.995 ms
+TPOT:      8.527 ms
+prefix:    89.28%
+nodes:     3, height=1
+
+[EVAL] mul(P, P)
+       TTFT=96.054 ms, P99-TTFT=259.887 ms, TPOT=29.932 ms, prefix=89.38%
+
+[EVAL] mul(sqrtabs(BS), BS)
+       TTFT=115.056 ms, P99-TTFT=543.804 ms, TPOT=8.256 ms, prefix=69.81%
+
+=== Generation 1 ===
+best expr: mul(P, BS)
+fitness:   1.000000
+TTFT:      69.661 ms
+P99 TTFT:  195.995 ms
+TPOT:      8.527 ms
+prefix:    89.28%
+nodes:     3, height=1
+
+[EVAL] mul(sqrtabs(P), 0.22779897509858493)
+       TTFT=96.054 ms, P99-TTFT=259.887 ms, TPOT=29.932 ms, prefix=89.38%
+
+[EVAL] mul(BS, BS)
+       TTFT=115.056 ms, P99-TTFT=543.804 ms, TPOT=8.256 ms, prefix=69.81%
+
+=== Generation 2 ===
+best expr: mul(P, BS)
+fitness:   1.000000
+TTFT:      69.661 ms
+P99 TTFT:  195.995 ms
+TPOT:      8.527 ms
+prefix:    89.28%
+nodes:     3, height=1
+
+[EVAL] mul(P, absval(BS))
+       TTFT=69.661 ms, P99-TTFT=195.995 ms, TPOT=8.527 ms, prefix=89.28%
+
+[EVAL] mul(P, sqrtabs(P))
+       TTFT=96.054 ms, P99-TTFT=259.887 ms, TPOT=29.932 ms, prefix=89.38%
+
+=== Generation 3 ===
+best expr: mul(P, BS)
+fitness:   1.000000
+TTFT:      69.661 ms
+P99 TTFT:  195.995 ms
+TPOT:      8.527 ms
+prefix:    89.28%
+nodes:     3, height=1
+
+[EVAL] mul(P, -1.3394921641034894)
+       TTFT=138.439 ms, P99-TTFT=434.018 ms, TPOT=12.655 ms, prefix=63.96%
+
+=== Generation 4 ===
+best expr: mul(P, BS)
+fitness:   1.000000
+TTFT:      69.661 ms
+P99 TTFT:  195.995 ms
+TPOT:      8.527 ms
+prefix:    89.28%
+nodes:     3, height=1
+
+
+================ FINAL HALL OF FAME ================
+ 1. fitness=1.000000 TTFT=69.661 TPOT=8.527 nodes= 4 :: mul(P, absval(BS))
+ 2. fitness=1.000000 TTFT=69.661 TPOT=8.527 nodes= 3 :: mul(P, BS)
+ 3. fitness=1.024660 TTFT=71.361 TPOT=8.529 nodes= 4 :: mul(P, square(BS))
+ 4. fitness=1.024660 TTFT=71.361 TPOT=8.529 nodes= 4 :: mul(sqrtabs(P), BS)
+ 5. fitness=1.034413 TTFT=69.704 TPOT=8.815 nodes= 4 :: mul(P, sqrtabs(BS))
+ 6. fitness=1.599092 TTFT=115.056 TPOT=8.256 nodes= 3 :: mul(BS, BS)
+ 7. fitness=1.599092 TTFT=115.056 TPOT=8.256 nodes= 4 :: mul(sqrtabs(BS), BS)
+ 8. fitness=1.599092 TTFT=115.056 TPOT=8.256 nodes= 1 :: BS
+ 9. fitness=2.949351 TTFT=138.439 TPOT=12.655 nodes= 3 :: mul(P, -1.3394921641034894)
+10. fitness=3.888799 TTFT=89.391 TPOT=25.841 nodes= 3 :: add(P, BS)
+
+Saved hall of fame: /app/LLMServingSim/outputs/gp_router_search/hall_of_fame.json
+Saved best expression: /app/LLMServingSim/outputs/gp_router_search/best_expression.txt
+
+Full-trace validation:
+  ROUTING_EXPR='mul(P, absval(BS))' python -m serving \
+    --cluster-config configs/cluster/single_node_qwen4_instance.json \
+    --dtype bfloat16 --block-size 16 \
+    --request-routing-policy CUSTOM \
+    --dataset workloads/swe-bench-qwen3-30b-a3b-50-sps0.2.jsonl \
+    --output outputs/swebench_qwen4_SYMBOLIC.csv
+root@f25f125dc5d6:/app/LLMServingSim# client_loop: send disconnect: Connection reset
