@@ -23,12 +23,12 @@ set -euo pipefail
 # ``configs/model/<MODEL>.json`` relative to the LLMServingSim root.
 # The profiler reads model_type from that config to pick an
 # architecture yaml under profiler/models/.
-# MODEL="meta-llama/Llama-3.1-8B"
-MODEL="Qwen/Qwen3-32B"
+MODEL="meta-llama/Llama-3.1-8B"
+#MODEL="Qwen/Qwen3-32B"
 
 # GPU identifier used as an output folder name under ``perf/``.
 # Free-form — pick something meaningful for your hardware.
-HARDWARE="RTXPRO6000"
+HARDWARE="A40"
 
 # =============================================================================
 # EDIT THESE (OPTIONAL — uncomment and adjust as needed)
@@ -36,22 +36,22 @@ HARDWARE="RTXPRO6000"
 
 # --- TP sweep ---------------------------------------------------------------
 # Comma-separated list; must include 1.
-TP_DEGREES="1,2"
+TP_DEGREES="1"
 
 # --- Engine kwargs ----------------------------------------------------------
 # DTYPE is normally inferred from the model config's ``torch_dtype``
 # field (bfloat16 for every model currently in configs/model/). Only
 # set it explicitly to force a different weight dtype.
 # KV_CACHE_DTYPE defaults to "auto" which inherits DTYPE.
-# DTYPE="bfloat16"                 # bfloat16 / float16 / float32 / fp8
-# KV_CACHE_DTYPE="fp8"             # auto / fp8 / fp16 / bf16
+DTYPE="bfloat16"                 # bfloat16 / float16 / float32 / fp8
+KV_CACHE_DTYPE="auto"             # auto / fp8 / fp16 / bf16
 MAX_NUM_BATCHED_TOKENS=2048      # vLLM's --max-num-batched-tokens
 MAX_NUM_SEQS=256                 # vLLM's --max-num-seqs
 
 # --- Attention grid ---------------------------------------------------------
 # Upper bound for kv_prefill / kv_decode axes. The grid grows
 # geometrically from 512 up to min(this, max_model_len).
-ATTENTION_MAX_KV=16384
+ATTENTION_MAX_KV=32768 #16384
 # Geometric factor for the prefill_chunk axis (grows from 16 up to
 # MAX_NUM_BATCHED_TOKENS). 2.0 is doubling; lower for denser sampling
 # on the quadratic-cost regime at the cost of longer profile time.
